@@ -14,6 +14,19 @@ Con menú propio de estilo consola, mando, generación de fotogramas FSR3 y reso
   <a href="https://ko-fi.com/nova5emu">Ko-fi</a>
 </p>
 
+## Capturas
+
+<p align="center">
+  <img src="docs/capturas/novas-menu.jpg" width="900" alt="Menú de NovaS con forma de consola">
+</p>
+<p align="center">
+  <img src="docs/capturas/zelda-pueblo.jpg" width="445" alt="Zelda: Ocarina of Time en NovaS">
+  <img src="docs/capturas/novas-ajustes.jpg" width="445" alt="Ajustes de NovaS">
+</p>
+<p align="center">
+  <img src="docs/capturas/web.jpg" width="900" alt="La página de NovaS">
+</p>
+
 ## Descargar
 
 En [Releases](https://github.com/nova5emu/novas/releases/latest):
