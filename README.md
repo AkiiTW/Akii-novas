@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="dist/novas.ico" width="96" alt="NovaS">
+  <img src="docs/novas-logo.png" width="110" alt="NovaS">
 </p>
 
 <h1 align="center">NovaS</h1>
@@ -13,6 +13,8 @@ Con menú propio de estilo consola, mando, generación de fotogramas FSR3 y reso
   <a href="https://x.com/nova5emu">X</a> ·
   <a href="https://ko-fi.com/nova5emu">Ko-fi</a>
 </p>
+
+> **English:** NovaS is a free, open-source Switch 2 emulator for Windows, with its own console-style menu (in English or Spanish), controller support, FSR3 frame generation and up to 4K. Download it from [Releases](https://github.com/nova5emu/novas/releases/latest). It includes no games, keys or firmware: use your own console's.
 
 ## Capturas
 
