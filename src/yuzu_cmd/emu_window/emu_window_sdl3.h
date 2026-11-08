@@ -53,6 +53,10 @@ public:
     /// Shows text in the window title right away (the shader preload's count).
     void SetCaption(const std::string& caption);
 
+    SDL_Window* GetSdlWindow() const {
+        return render_window;
+    }
+
     /// Returns if window is shown (not minimized)
     bool IsShown() const override;
 

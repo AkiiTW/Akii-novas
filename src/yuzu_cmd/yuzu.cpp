@@ -516,6 +516,98 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
+// A popup over the game window while the shaders load: black, with the count and a bar. The game
+// window itself shows nothing meaningful until the game draws (leftovers of an earlier frame). The
+// software renderer keeps it away from the Vulkan device; no popup (or no renderer) leaves the title
+// as the only display.
+class PreloadOverlay {
+public:
+    explicit PreloadOverlay(SDL_Window* parent_) : parent{parent_} {
+        int width = 0;
+        int height = 0;
+        if (!parent || !SDL_GetWindowSize(parent, &width, &height) || width <= 0 || height <= 0) {
+            return;
+        }
+        window = SDL_CreatePopupWindow(parent, 0, 0, width, height, SDL_WINDOW_TOOLTIP);
+        if (!window) {
+            LOG_WARNING(Frontend, "Shader preload overlay: no popup window: {}", SDL_GetError());
+            return;
+        }
+        renderer = SDL_CreateRenderer(window, SDL_SOFTWARE_RENDERER);
+        if (!renderer) {
+            LOG_WARNING(Frontend, "Shader preload overlay: no renderer: {}", SDL_GetError());
+            SDL_DestroyWindow(window);
+            window = nullptr;
+        }
+    }
+
+    ~PreloadOverlay() {
+        if (renderer) {
+            SDL_DestroyRenderer(renderer);
+        }
+        if (window) {
+            SDL_DestroyWindow(window);
+        }
+    }
+
+    PreloadOverlay(const PreloadOverlay&) = delete;
+    PreloadOverlay& operator=(const PreloadOverlay&) = delete;
+
+    void Draw(size_t value, size_t count) {
+        if (!renderer) {
+            return;
+        }
+        int width = 0;
+        int height = 0;
+        if (!SDL_GetWindowSize(parent, &width, &height) || width <= 0 || height <= 0) {
+            return;
+        }
+        int own_width = 0;
+        int own_height = 0;
+        SDL_GetWindowSize(window, &own_width, &own_height);
+        if (own_width != width || own_height != height) {
+            SDL_SetWindowSize(window, width, height);
+        }
+        SDL_SetRenderScale(renderer, 1.0f, 1.0f);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+
+        const float bar_width = static_cast<float>(width) * 0.5f;
+        const float bar_height = (std::max)(6.0f, static_cast<float>(height) / 90.0f);
+        const float bar_x = (static_cast<float>(width) - bar_width) / 2.0f;
+        const float bar_y = static_cast<float>(height) * 0.55f;
+        const float fraction =
+            count == 0 ? 0.0f : static_cast<float>(value) / static_cast<float>(count);
+        const SDL_FRect track{bar_x, bar_y, bar_width, bar_height};
+        const SDL_FRect fill{bar_x, bar_y, bar_width * fraction, bar_height};
+        SDL_SetRenderDrawColor(renderer, 45, 45, 45, 255);
+        SDL_RenderFillRect(renderer, &track);
+        SDL_SetRenderDrawColor(renderer, 235, 235, 235, 255);
+        SDL_RenderFillRect(renderer, &fill);
+
+        // SDL's debug font: 8x8 pixels per character, ASCII only.
+        const float scale = (std::max)(1.0f, static_cast<float>(height) / 360.0f);
+        SDL_SetRenderScale(renderer, scale, scale);
+        const auto centered = [&](const std::string& text, float y) {
+            const float x = (static_cast<float>(width) / scale -
+                             static_cast<float>(text.size()) * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE) /
+                            2.0f;
+            SDL_RenderDebugText(renderer, x, y / scale, text.c_str());
+        };
+        SDL_SetRenderDrawColor(renderer, 235, 235, 235, 255);
+        centered("Chargement des shaders", bar_y - 3.2f * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE * scale);
+        centered(count == 0 ? std::string{"Preparation..."}
+                            : fmt::format("{} / {}  ({}%)", value, count, value * 100 / count),
+                 bar_y + bar_height + 1.5f * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE * scale);
+        SDL_RenderPresent(renderer);
+    }
+
+private:
+    SDL_Window* parent{};
+    SDL_Window* window{};
+    SDL_Renderer* renderer{};
+};
+
 // The shader preload ran here on the main thread and took minutes with a large cache (55,000
 // pipelines): no SDL event was handled meanwhile, the window stayed black, and Windows reported it
 // as not responding at the first click. With Vulkan the preload runs on a worker while this thread
@@ -543,6 +635,7 @@ static void LoadDiskShaders(SdlState& state) {
         done.store(true, std::memory_order_release);
     });
     std::string shown;
+    PreloadOverlay overlay{state.emu_window->GetSdlWindow()};
     while (!done.load(std::memory_order_acquire)) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -561,6 +654,7 @@ static void LoadDiskShaders(SdlState& state) {
             state.emu_window->SetCaption(caption);
             shown = caption;
         }
+        overlay.Draw(value, count);
         SDL_Delay(50);
     }
     worker.join();
