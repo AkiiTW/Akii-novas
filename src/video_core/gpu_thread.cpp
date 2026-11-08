@@ -55,6 +55,8 @@ ThreadManager::~ThreadManager() = default;
 
 void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Frontend::GraphicsContext& context, Tegra::Control::Scheduler& scheduler) {
     rasterizer = renderer.ReadRasterizer();
+    // Before the GPU thread and the split's back thread start: they read it without a lock.
+    Nx2Profile::ReadSetting();
     thread = std::jthread([&](std::stop_token stop_token) {
         const Common::DkbCpuTrace::Registration cpu_trace{Common::DkbCpuTrace::Role::GpuCommand};
         Common::SetCurrentThreadName("GPU");

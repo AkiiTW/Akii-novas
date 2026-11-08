@@ -19,6 +19,7 @@
 #include "core/memory.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_profile.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/command_fetch_order.h"
 #include "video_core/control/channel_state.h"
@@ -711,7 +712,9 @@ bool DmaPusher::WaitForListWriters(GPUVAddr address, size_t size, bool& verified
     verified_live = false;
     ++stats.checks;
     SCOPE_EXIT {
-        if ((stats.checks & 0x3ff) == 0) {
+        // At each power of two, then every 2^20: Bananza makes ~70,000 checks a second, and every
+        // 1024 filled its log with ~1 MB a minute now that it is on by default there.
+        if ((stats.checks & (stats.checks - 1)) == 0 || (stats.checks & 0xfffff) == 0) {
             LOG_INFO(HW_GPU,
                      "List target mode={} channel={}: checks={} waits={} unknown={} "
                      "shorter_pending={} fallback={} verified={} changed_entries={} "
@@ -1023,6 +1026,9 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     if (!IsGpuWrittenCommands(address, size)) {
         return false;
     }
+    namespace SyncProfile = VideoCommon::Nx2SyncProfile;
+    SyncProfile::Report();
+    SyncProfile::Add(SyncProfile::Counter::ListFallbacks);
     // The caches belong to the split's back: it first runs what the front queued (the dispatch
     // that writes these words among it). The whole pages are flushed: their next lists read
     // guest memory until GPU work writes them again.
@@ -1034,7 +1040,10 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         diag_before.resize(size / sizeof(u32));
         memory_manager.ReadBlockUnsafe(address, diag_before.data(), diag_before.size() * sizeof(u32));
     }
-    VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::ListFlush);
+    {
+        SyncProfile::Scope scope{SyncProfile::Timer::ListPreDrain};
+        VideoCommon::GpuSplit::Get().Drain(VideoCommon::DrainSite::ListFlush);
+    }
     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
     const bool dirty = memory_manager.IsMemoryDirty(first_page, end_page - first_page,
@@ -1046,17 +1055,21 @@ bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
                 pages.push_back(*device);
             }
         }
-        VideoCommon::GpuSplit::Get().Run(
+        SyncProfile::Run(
             [rasterizer = rasterizer, pages = std::span<const DAddr>{pages}] {
                 rasterizer->FlushGpuWrittenCommandListPages(pages);
             },
-            VideoCommon::DrainSite::ListFlush);
+            VideoCommon::DrainSite::ListFlush, SyncProfile::Timer::ListRun,
+            SyncProfile::Timer::ListPostDrain, SyncProfile::Timer::ListQueue,
+            SyncProfile::Timer::ListCallback);
     } else if (dirty) {
-        VideoCommon::GpuSplit::Get().Run(
+        SyncProfile::Run(
             [memory = &memory_manager, first_page, size = end_page - first_page] {
                 memory->FlushRegion(first_page, size, VideoCommon::CacheType::BufferCache);
             },
-            VideoCommon::DrainSite::ListFlush);
+            VideoCommon::DrainSite::ListFlush, SyncProfile::Timer::ListRun,
+            SyncProfile::Timer::ListPostDrain, SyncProfile::Timer::ListQueue,
+            SyncProfile::Timer::ListCallback);
     }
     if (diag) {
         auto kind = Nx2CmdPageDiag::Kind::NoWrite;

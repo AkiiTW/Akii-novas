@@ -14,6 +14,7 @@
 #include <optional>
 
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -88,9 +89,12 @@ void DrainBack() {
 // The fence manager records into the scheduler and downloads the CPU's writes over GPU data:
 // the back's state, which a drained back still uses from its idle hook (it submits).
 void ReleaseFences(DmaPusher& dma_pusher) {
-    VideoCommon::GpuSplit::Get().Run(
+    namespace SyncProfile = VideoCommon::Nx2SyncProfile;
+    SyncProfile::Run(
         [rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-        VideoCommon::DrainSite::FenceRelease);
+        VideoCommon::DrainSite::FenceRelease, SyncProfile::Timer::FenceRun,
+        SyncProfile::Timer::FenceDrain, SyncProfile::Timer::FenceQueue,
+        SyncProfile::Timer::FenceCallback);
 }
 
 } // Anonymous namespace

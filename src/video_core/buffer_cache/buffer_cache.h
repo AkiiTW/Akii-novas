@@ -28,6 +28,7 @@
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/nx2_sync_profile.h"
 #include "video_core/texture_cache/util.h"
 
 namespace VideoCommon {
@@ -446,6 +447,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                                     .dst_offset = total_size_bytes,
                                     .size = range_end - start,
                                 };
+                                Nx2SyncProfile::RecordDownload(copy.size);
                                 if (is_mapped) {
                                     mapped.push_back({buffer_id, copy});
                                     return;
@@ -2321,6 +2323,8 @@ void BufferCache<P>::Nx2NoteListSynced(DAddr page) {
 
 template <class P>
 void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
+    Nx2SyncProfile::Report();
+    Nx2SyncProfile::Add(Nx2SyncProfile::Counter::ListBatches);
     constexpr u64 page_size = u64{1} << Tegra::Nx2WrittenPageBits;
     boost::container::small_vector<std::pair<DAddr, u64>, 16> ranges;
     for (const DAddr page : pages) {
@@ -2329,14 +2333,35 @@ void BufferCache<P>::Nx2FlushListPages(std::span<const DAddr> pages) {
     boost::container::small_vector<std::pair<DAddr, u64>, 16> drawn;
     if constexpr (!IS_OPENGL) {
         std::scoped_lock lock{nx2_list_mutex};
+        if (Nx2Profile::Enabled()) {
+            for (auto page = pages.begin(); page != pages.end(); ++page) {
+                if (std::find(pages.begin(), page, *page) != page) {
+                    continue;
+                }
+                const auto it = nx2_list_pages.find(*page);
+                const auto counter = it == nx2_list_pages.end()
+                    ? Nx2SyncProfile::Counter::RequestedUntrackedPages
+                    : it->second.synced_writes == it->second.writes
+                        ? Nx2SyncProfile::Counter::RequestedReusedPages
+                        : Nx2SyncProfile::Counter::RequestedNewPages;
+                Nx2SyncProfile::Add(counter);
+            }
+        }
         for (const auto& [page, entry] : nx2_list_pages) {
             if (entry.draw_written && entry.synced_writes != entry.writes) {
                 ranges.emplace_back(page, page_size);
                 drawn.emplace_back(page, entry.writes);
+                if (Nx2Profile::Enabled() &&
+                    std::find(pages.begin(), pages.end(), page) == pages.end()) {
+                    Nx2SyncProfile::Add(Nx2SyncProfile::Counter::ExtraDrawnPages);
+                }
             }
         }
     }
-    DownloadRangesMemory(ranges);
+    {
+        Nx2SyncProfile::ListDownloadScope scope;
+        DownloadRangesMemory(ranges);
+    }
     if constexpr (!IS_OPENGL) {
         std::scoped_lock lock{nx2_list_mutex};
         for (const auto& [page, writes] : drawn) {
@@ -2843,6 +2868,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
                     .dst_offset = total_size_bytes,
                     .size = new_size,
                 });
+                Nx2SyncProfile::RecordDownload(new_size);
                 // Align up to avoid cache conflicts
                 constexpr u64 align = 64ULL;
                 constexpr u64 mask = ~(align - 1ULL);

@@ -272,9 +272,14 @@ int GpuSplit::ListPagesMode() {
 int GpuSplit::ListTargetMode() {
     static const int mode = [] {
         const char* value = std::getenv("EDEN_NX2_LIST_TARGET");
-        return value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0'
-                   ? value[0] - '0'
-                   : 0;
+        if (value == nullptr) {
+            // On for Donkey Kong Bananza: mode 2 verified 15.5 million list fetches on its three
+            // channels with no difference (2026-11-07), and mode 1 cut its worst frames from 180
+            // to 72 ms. Read with the game running: the GPU parses no list before it starts.
+            constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+            return Settings::GetCurrentProgramID() == DonkeyKongBananzaProgramId ? 1 : 0;
+        }
+        return (value[0] == '1' || value[0] == '2') && value[1] == '\0' ? value[0] - '0' : 0;
     }();
     return mode;
 }

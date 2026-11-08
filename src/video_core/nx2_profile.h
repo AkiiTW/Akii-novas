@@ -76,8 +76,14 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "writer wait", "list submit wait", "list GPU wait",
 };
 
-// Read once at startup: Enabled() runs several times per method write (no guard to check).
-inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+// Enabled() runs several times per method write, so it reads a plain flag (no guard to check).
+// ReadSetting() fills it when the GPU thread starts: by then the frontend has applied
+// nx2_switches.txt, which a static initializer would run before (the file never enabled it).
+inline bool g_enabled = false;
+
+inline void ReadSetting() {
+    g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+}
 
 inline bool Enabled() {
     return g_enabled;
