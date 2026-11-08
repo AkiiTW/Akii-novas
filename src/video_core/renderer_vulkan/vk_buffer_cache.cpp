@@ -455,6 +455,10 @@ u32 BufferCacheRuntime::GetUniformBufferAlignment() const {
     return static_cast<u32>(device.GetUniformBufferAlignment());
 }
 
+u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
+    return device.GetMaxStorageBufferRange();
+}
+
 u32 BufferCacheRuntime::GetStorageBufferAlignment() const {
     return static_cast<u32>(device.GetStorageBufferAlignment());
 }

@@ -207,6 +207,11 @@ public:
         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
     }
 
+    /// The smallest GL_MAX_SHADER_STORAGE_BLOCK_SIZE an implementation may report (128 MiB).
+    u64 GetMaxStorageBufferRange() const {
+        return u64{1} << 27;
+    }
+
 private:
     static constexpr std::array PABO_LUT{
         GL_VERTEX_PROGRAM_PARAMETER_BUFFER_NV,          GL_TESS_CONTROL_PROGRAM_PARAMETER_BUFFER_NV,

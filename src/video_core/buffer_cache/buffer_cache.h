@@ -3082,14 +3082,27 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     }
     const Binding binding = [&]() -> Binding {
         u32 size = [&]() {
-            const u32 memory_layout_size =
-                static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
+            // A mapping of 4 GiB or more would wrap to a small size.
+            const u32 memory_layout_size = static_cast<u32>((std::min)(
+                u64{gpu_memory->GetMemoryLayoutSize(gpu_addr)},
+                u64{(std::numeric_limits<u32>::max)()}));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
-            // it (Ocarina of Time's grass instances lie 12-18 MiB past theirs): bound to the end of
-            // its mapping, up to 64 MiB. The 8 MiB cap made those reads return 0 and culled every
-            // blade. Written pools keep the cap: a write marks the whole binding GPU-modified.
+            // it: bound to the end of its mapping, as far as a storage buffer may reach (at most
+            // 1 GiB), as Lichii does. Ocarina of Time's grass instances lie 12-18 MiB past theirs
+            // (an 8 MiB cap culled every blade) and its light probe records about 130 MiB past
+            // theirs; reads past the binding return 0. Written pools keep a cap: a write marks the
+            // whole binding GPU-modified. EDEN_NX2_TABLE_REACH_64=1 restores NovaS's 64 MiB cap.
             if (table_pointer && !is_written) {
-                return (std::min)(memory_layout_size, static_cast<u32>(64_MiB));
+                static const bool reach_64 = [] {
+                    const char* const value = std::getenv("EDEN_NX2_TABLE_REACH_64");
+                    return value != nullptr && value[0] == '1';
+                }();
+                if (reach_64) {
+                    return (std::min)(memory_layout_size, static_cast<u32>(64_MiB));
+                }
+                const u64 reach = (std::min)(runtime.GetMaxStorageBufferRange(), u64{1_GiB});
+                const u32 limit = static_cast<u32>(reach - (std::min)(reach, u64{64_KiB}));
+                return (std::min)(memory_layout_size, limit);
             }
             // A native (Switch 2) compute program's pointer is bare: the word after it is another
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
