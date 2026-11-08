@@ -50,6 +50,9 @@ public:
         game_title = std::move(title);
     }
 
+    /// Shows text in the window title right away (the shader preload's count).
+    void SetCaption(const std::string& caption);
+
     /// Returns if window is shown (not minimized)
     bool IsShown() const override;
 

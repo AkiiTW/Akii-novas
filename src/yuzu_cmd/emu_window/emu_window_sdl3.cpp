@@ -182,6 +182,10 @@ void EmuWindow_SDL3::ApplyPendingTitle() {
     SDL_SetWindowTitle(render_window, caption.c_str());
 }
 
+void EmuWindow_SDL3::SetCaption(const std::string& caption) {
+    SDL_SetWindowTitle(render_window, caption.c_str());
+}
+
 bool EmuWindow_SDL3::IsShown() const {
     return is_shown;
 }

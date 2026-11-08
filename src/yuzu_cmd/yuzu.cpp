@@ -21,6 +21,8 @@
 #include <optional>
 #include <regex>
 #include <string>
+#include <stop_token>
+#include <thread>
 #include "common/settings_enums.h"
 #include "core/launch_params.h"
 #ifdef __EMSCRIPTEN__
@@ -36,6 +38,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/string_util.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/cpu_manager.h"
@@ -513,6 +516,57 @@ static bool EditNup(const Core::LaunchParams& lp) {
     }
 }
 
+// The shader preload ran here on the main thread and took minutes with a large cache (55,000
+// pipelines): no SDL event was handled meanwhile, the window stayed black, and Windows reported it
+// as not responding at the first click. With Vulkan the preload runs on a worker while this thread
+// keeps the window answering and shows the count in its title; a close request stops the preload.
+// OpenGL keeps its context on this thread, so it loads here as before.
+static void LoadDiskShaders(SdlState& state) {
+    auto& rasterizer = *state.system.Renderer().ReadRasterizer();
+    const u64 program_id = state.system.GetApplicationProcessProgramID();
+    if (Settings::values.renderer_backend.GetValue() != Settings::RendererBackend::Vulkan) {
+        rasterizer.LoadDiskResources(program_id, std::stop_token{},
+                                     [](VideoCore::LoadCallbackStage, size_t, size_t) {});
+        return;
+    }
+    std::atomic<size_t> loaded{};
+    std::atomic<size_t> total{};
+    std::atomic<bool> done{};
+    std::stop_source stop;
+    std::thread worker([&] {
+        Common::SetCurrentThreadName("ShaderPreload");
+        rasterizer.LoadDiskResources(program_id, stop.get_token(),
+                                     [&](VideoCore::LoadCallbackStage, size_t value, size_t count) {
+                                         total.store(count, std::memory_order_relaxed);
+                                         loaded.store(value, std::memory_order_relaxed);
+                                     });
+        done.store(true, std::memory_order_release);
+    });
+    std::string shown;
+    while (!done.load(std::memory_order_acquire)) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_EVENT_QUIT || event.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
+                stop.request_stop();
+                exit_requested.store(true, std::memory_order_relaxed);
+            }
+        }
+        const size_t count = total.load(std::memory_order_relaxed);
+        const size_t value = (std::min)(loaded.load(std::memory_order_relaxed), count);
+        const std::string caption =
+            count == 0 ? std::string{"NovaS \xC2\xB7 Shaders..."}
+                       : fmt::format("NovaS \xC2\xB7 Shaders {} / {} ({}%)", value, count,
+                                     value * 100 / count);
+        if (caption != shown) {
+            state.emu_window->SetCaption(caption);
+            shown = caption;
+        }
+        SDL_Delay(50);
+    }
+    worker.join();
+    LOG_INFO(Frontend, "Shader preload done: {} of {}", loaded.load(), total.load());
+}
+
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     FrontendCommon::LoadNx2Switches(
         argv[0], Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir));
@@ -725,9 +779,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->system.GetCpuManager().OnGpuReady();
 
     if (Settings::values.use_disk_shader_cache.GetValue()) {
-        state->system.Renderer().ReadRasterizer()->LoadDiskResources(
-            state->system.GetApplicationProcessProgramID(), std::stop_token{},
-            [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
+        LoadDiskShaders(*state);
     }
 
     state->system.RegisterExitCallback([] { exit_requested.store(true, std::memory_order_relaxed); });

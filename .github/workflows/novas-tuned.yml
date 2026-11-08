@@ -1,6 +1,7 @@
 name: novas-tuned
 
-# AkiiTW's NovaS fork (lichii.exe is NovaS; rename it NovaSEmulator.exe or run it as is).
+# AkiiTW's NovaS fork. NovaSEmulator.exe is the game window NovaS starts (SDL3); lichii.exe is the
+# Qt frontend NovaS also builds.
 # Windows build tuned for one CPU family: MSYS2 clang with a PGO profile, plus -march/-mtune from
 # YUZU_BUILD_PRESET. Three flavors, uploaded as artifacts (no release is made):
 #   normal  the PGO build;
@@ -220,7 +221,7 @@ jobs:
           export PATH="/ucrt64/bin:$PATH"
           cd build/release/bin
           test -f lichii.exe
-          test -f eden-cli.exe
+          test -f NovaSEmulator.exe
           if [ '${{ matrix.flavor }}' = 'symbols' ]; then test -f lichii.pdb; fi
           windeployqt6 --no-translations --no-compiler-runtime --no-opengl-sw \
             --no-system-dxc-compiler --no-system-d3d-compiler lichii.exe
@@ -238,7 +239,7 @@ jobs:
               fi
             done
           }
-          for exe in lichii.exe eden-cli.exe; do
+          for exe in lichii.exe NovaSEmulator.exe; do
             deps "$exe"
           done
           find . -name '*.dll' | while read -r dll; do
