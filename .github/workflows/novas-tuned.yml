@@ -1,0 +1,254 @@
+name: novas-tuned
+
+# AkiiTW's NovaS fork (lichii.exe is NovaS; rename it NovaSEmulator.exe or run it as is).
+# Windows build tuned for one CPU family: MSYS2 clang with a PGO profile, plus -march/-mtune from
+# YUZU_BUILD_PRESET. Three flavors, uploaded as artifacts (no release is made):
+#   normal  the PGO build;
+#   lto     the same with ThinLTO;
+#   symbols the normal build plus CodeView line tables and lichii.pdb next to the exe, so the
+#           built-in sampler (EDEN_NX2_SAMPLE) names functions on the player's PC;
+#   pgogen  a build with the GPU emulation instrumented (-fprofile-generate on video_core and
+#           shader_recompiler) that writes default_*.profraw next to
+#           lichii.exe when it exits normally.
+# Profiles: .profraw files (or .zip archives of them) committed under pgo/ are merged into the
+# profile the normal and lto flavors use, weighted over eglantine.profdata; without them,
+# eglantine.profdata alone is used.
+on:
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: CPU preset (zen2 = Ryzen 3000, zen4 = Ryzen 7000, v3 = any AVX2 CPU)
+        type: choice
+        options: [zen2, zen4, v3, generic]
+        default: zen2
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "CMakeLists.txt"
+      - "dist/**"
+      - "pgo/**"
+      - ".github/workflows/novas-tuned.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: windows ${{ inputs.preset || 'zen2' }} ${{ matrix.flavor }}
+    runs-on: windows-2022
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        # lto stays out of the matrix: the ThinLTO + PGO binary broke Ocarina at boot (guest
+        # abort 12 s in, read of 0x2) where the same commit's normal build ran.
+        flavor: [normal, pgogen, symbols]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3000M
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Check PGO profile
+        shell: bash
+        run: test -s eglantine.profdata
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            git make autoconf libtool automake-wrapper patch jq pactoys ninja unzip
+          pacboy: >-
+            toolchain:p clang:p lld:p cmake:p python-pip:p compiler-rt:p llvm-tools:p
+            qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
+            openssl:p boost:p fmt:p lz4:p nlohmann-json:p zlib:p zstd:p libiconv:p
+            vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
+            libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
+            lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
+
+      - name: Restore CPM downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-windows-x86_64-pgo-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-windows-x86_64-pgo-v2-
+            cpm-Windows-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .ccache
+          key: objects-tuned-${{ inputs.preset || 'zen2' }}-${{ matrix.flavor }}-${{ github.sha }}-${{ github.run_id }}
+          restore-keys: |
+            objects-tuned-${{ inputs.preset || 'zen2' }}-${{ matrix.flavor }}-
+
+      # The profile runtime must link and its output must merge before an hour of instrumented
+      # build. MSYS2 may ship compiler-rt for another clang version than the compiler: its
+      # library is then copied where this clang looks for it.
+      - name: Check the profile runtime
+        if: matrix.flavor == 'pgogen'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          cd "$(mktemp -d)"
+          printf 'int main(void) { return 0; }\n' > t.c
+          if ! clang -fprofile-generate -fuse-ld=lld t.c -o t.exe; then
+            lib=$(ls /ucrt64/lib/clang/*/lib/windows/libclang_rt.profile-x86_64.a | head -n 1)
+            dir=$(clang -print-runtime-dir)
+            echo "Copying $lib to $dir"
+            mkdir -p "$dir" "$(clang -print-resource-dir)/lib/windows"
+            cp "$lib" "$dir/libclang_rt.profile.a"
+            cp "$lib" "$dir/libclang_rt.profile-x86_64.a"
+            cp "$lib" "$(clang -print-resource-dir)/lib/windows/libclang_rt.profile-x86_64.a"
+            clang -fprofile-generate -fuse-ld=lld t.c -o t.exe
+          fi
+          ./t.exe
+          ls -la ./*.profraw
+          llvm-profdata merge -o t.profdata ./*.profraw
+          llvm-profdata show t.profdata | head -n 5
+
+      - name: Merge the Ocarina profile
+        if: matrix.flavor != 'pgogen'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          mkdir -p build/pgo
+          for archive in pgo/*.zip; do
+            unzip -o -q -d build/pgo "$archive"
+          done
+          raws=(pgo/*.profraw build/pgo/**/*.profraw)
+          if [ ${#raws[@]} -eq 0 ]; then
+            echo "No profile under pgo/: eglantine.profdata only"
+            cp eglantine.profdata build/use.profdata
+            exit 0
+          fi
+          echo "Ocarina profile from ${#raws[@]} file(s)"
+          weighted=()
+          for raw in "${raws[@]}"; do
+            weighted+=("--weighted-input=4,$raw")
+          done
+          if ! llvm-profdata merge -o build/use.profdata "${weighted[@]}" eglantine.profdata; then
+            echo "eglantine.profdata did not merge: the Ocarina profile alone"
+            llvm-profdata merge -o build/use.profdata "${raws[@]}"
+          fi
+          llvm-profdata show build/use.profdata | head -n 5
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          gpu_pgo=OFF
+          if [ '${{ matrix.flavor }}' = 'pgogen' ]; then
+            # Only video_core and shader_recompiler are instrumented (LICHII_PGO_GENERATE_GPU):
+            # instrumenting everything left Ocarina stuck at boot (ZBIC NSO decompression failed).
+            profile=""
+            gpu_pgo=ON
+          else
+            profile="-fprofile-use=$(cygpath -m "$PWD/build/use.profdata") -Wno-backend-plugin \
+              -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+          fi
+          # CMake's IPO check fails under MSYS2 clang (UseLTO.cmake stops the configure), so
+          # ThinLTO goes in the flags directly, with LLVM's archiver for the bitcode objects.
+          lto=()
+          linker="-fuse-ld=lld"
+          if [ '${{ matrix.flavor }}' = 'lto' ]; then
+            profile="$profile -flto=thin"
+            linker="$linker -flto=thin"
+            lto=(-DCMAKE_AR=/ucrt64/bin/llvm-ar.exe -DCMAKE_RANLIB=/ucrt64/bin/llvm-ranlib.exe)
+          fi
+          if [ '${{ matrix.flavor }}' = 'pgogen' ]; then
+            linker="$linker -fprofile-generate"
+          fi
+          if [ '${{ matrix.flavor }}' = 'symbols' ]; then
+            # Line tables only: the same optimized code, with names and lines for dbghelp.
+            profile="$profile -gline-tables-only -gcodeview"
+            linker="$linker -Wl,--pdb="
+          fi
+          cmake -S . -B build/release -G Ninja "${lto[@]}" -DLICHII_PGO_GENERATE_GPU=$gpu_pgo \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DYUZU_TESTS=OFF \
+            -DYUZU_CMD=ON \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_ROOM_STANDALONE=OFF \
+            -DYUZU_USE_BUNDLED_QT=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DLICHII_BUILD_TAG=tuned-${{ inputs.preset || 'zen2' }}-${{ github.run_number }} \
+            -DLICHII_BUILD_PLATFORM=windows-x86_64-${{ inputs.preset || 'zen2' }} \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            -DUSE_CCACHE=ON \
+            -DYUZU_BUILD_PRESET=${{ inputs.preset || 'zen2' }} \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            "-DCMAKE_EXE_LINKER_FLAGS=$linker" \
+            "-DCMAKE_C_FLAGS=$profile" \
+            "-DCMAKE_CXX_FLAGS=$profile"
+
+      - name: Build
+        shell: msys2 {0}
+        run: |
+          ccache --zero-stats
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          ccache --show-stats
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: .ccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      # Same packaging as the release workflow's MinGW job (docs/Caveats.md#msys2).
+      - name: Package
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          export PATH="/ucrt64/bin:$PATH"
+          cd build/release/bin
+          test -f lichii.exe
+          test -f eden-cli.exe
+          if [ '${{ matrix.flavor }}' = 'symbols' ]; then test -f lichii.pdb; fi
+          windeployqt6 --no-translations --no-compiler-runtime --no-opengl-sw \
+            --no-system-dxc-compiler --no-system-d3d-compiler lichii.exe
+          deps() {
+            objdump -p "$1" | awk '/DLL Name:/ {print $3}' | while read -r dll; do
+              [ -z "$dll" ] && continue
+              source=$(command -v "$dll" 2>/dev/null || true)
+              [ -z "$source" ] && continue
+              case "$source" in
+                *System32* | *SysWOW64*) continue ;;
+              esac
+              if [ ! -f "$dll" ]; then
+                cp "$source" "$dll"
+                deps "$source"
+              fi
+            done
+          }
+          for exe in lichii.exe eden-cli.exe; do
+            deps "$exe"
+          done
+          find . -name '*.dll' | while read -r dll; do
+            deps "$dll"
+          done
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: akii-novas-windows-${{ inputs.preset || 'zen2' }}-${{ matrix.flavor }}-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <chrono>
+#include <memory>
+#include <mutex>
+
 #include <qdebug.h>
 #include "core/core.h"
 #include "core/cpu_manager.h"
@@ -9,6 +13,32 @@
 #include "video_core/gpu.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
+
+namespace {
+// Pipeline builds report every finished pipeline, from several worker threads, and each report
+// was a queued signal the GUI thread had to lay out and repaint. With tens of thousands of cached
+// pipelines the GUI fell behind its event queue, so a click or key press during the load went
+// unanswered and Windows offered to end the program. Forward a stage change, the last pipeline and
+// otherwise at most one report every 50 ms.
+class ProgressThrottle {
+public:
+    bool ShouldEmit(VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
+        const auto now = std::chrono::steady_clock::now();
+        std::scoped_lock lock{mutex};
+        if (stage == last_stage && value != total && now - last_emit < std::chrono::milliseconds{50}) {
+            return false;
+        }
+        last_stage = stage;
+        last_emit = now;
+        return true;
+    }
+
+private:
+    std::mutex mutex;
+    VideoCore::LoadCallbackStage last_stage{VideoCore::LoadCallbackStage::Complete};
+    std::chrono::steady_clock::time_point last_emit{};
+};
+} // Anonymous namespace
 
 EmuThread::EmuThread() {}
 
@@ -30,8 +60,11 @@ void EmuThread::run() {
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         QtCommon::system->Renderer().ReadRasterizer()->LoadDiskResources(
             QtCommon::system->GetApplicationProcessProgramID(), stop_token,
-            [this](VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
-                emit LoadProgress(stage, value, total);
+            [this, throttle = std::make_shared<ProgressThrottle>()](
+                VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
+                if (throttle->ShouldEmit(stage, value, total)) {
+                    emit LoadProgress(stage, value, total);
+                }
             });
     }
     emit LoadProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
@@ -95,8 +128,11 @@ void EmuThread::ReloadDiskShaderCache(u64 program_id) {
     emit ShaderCacheReloadStarted();
     emit LoadProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);
     system.Renderer().ReadRasterizer()->LoadDiskResources(program_id, m_stop_source.get_token(),
-        [this](VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
-            emit LoadProgress(stage, value, total);
+        [this, throttle = std::make_shared<ProgressThrottle>()](
+            VideoCore::LoadCallbackStage stage, std::size_t value, std::size_t total) {
+            if (throttle->ShouldEmit(stage, value, total)) {
+                emit LoadProgress(stage, value, total);
+            }
         });
     emit LoadProgress(VideoCore::LoadCallbackStage::Complete, 0, 0);
     emit ShaderCacheReloadFinished();
