@@ -24,6 +24,8 @@
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
+#include "video_core/memory_layout_cache.h"
+#include "video_core/nx2_draw_experiments.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/texture_cache/util.h"
@@ -762,6 +764,7 @@ const MemoryManager::MappingSnapshot& MemoryManager::CurrentSnapshot() const {
     std::scoped_lock lock{runs_guard};
     if (!snapshot || snapshot_serial != serial) {
         auto next = std::make_shared<MappingSnapshot>();
+        next->serial = serial;
         next->runs.reserve(continuous_runs.size());
         for (const auto& [begin, run] : continuous_runs) {
             next->runs.push_back({begin, run.end});
@@ -823,13 +826,20 @@ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr,
     // RangeMap::GetContinuousSizeFrom on the snapshot's copy of the kind map, without its lock.
     size_t result = 0;
     const s64 address = static_cast<s64>(gpu_addr);
-    const auto& kinds = CurrentSnapshot().kinds;
-    auto it = std::upper_bound(kinds.begin(), kinds.end(), address,
-                               [](s64 key, const auto& range) { return key < range.first; });
-    if (address >= 0 && it != kinds.begin() && std::prev(it)->second != PTEKind::INVALID) {
-        result = it == kinds.end()
-                     ? static_cast<size_t>((std::numeric_limits<s64>::max)() - address)
-                     : static_cast<size_t>(it->first - address);
+    const auto& mapping = CurrentSnapshot();
+    const auto& kinds = mapping.kinds;
+    if (VideoCommon::Nx2DrawExperiments::LayoutInterval()) {
+        // Adapt d713f4462 to NovaS's snapshot path; the locked kind_map is only a verifier.
+        thread_local MemoryLayoutCache cache;
+        result = cache.Query(unique_identifier, mapping.serial, kinds, gpu_addr);
+    } else {
+        auto it = std::upper_bound(kinds.begin(), kinds.end(), address,
+                                   [](s64 key, const auto& range) { return key < range.first; });
+        if (address >= 0 && it != kinds.begin() && std::prev(it)->second != PTEKind::INVALID) {
+            result = it == kinds.end()
+                         ? static_cast<size_t>((std::numeric_limits<s64>::max)() - address)
+                         : static_cast<size_t>(it->first - address);
+        }
     }
     if (VideoCommon::Nx2Perf::Verify()) {
         const size_t expected = GetMemoryLayoutSizeUncached(gpu_addr);

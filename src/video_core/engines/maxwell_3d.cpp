@@ -27,6 +27,7 @@
 #include "video_core/nx2.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_draw_experiments.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/query_cache/frame_trace.h"
 #include "video_core/query_dma.h"
@@ -1043,6 +1044,10 @@ struct Maxwell3D::FrontState {
     /// A method the draw manager handles was sent since the back last ran DrawDeferred: only
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
+    bool loop_draw_pending{true}; ///< Mode 1's pending work while mode 2 sends candidates too.
+    int macro_loop_mode{-1}; ///< Keep a live switch change from splitting one macro's verification.
+    bool sink_pending{}; ///< State writes queued for the back's next executable method.
+    bool skip_vertex_stores{};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
     /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
     bool upload_known{};
@@ -1158,6 +1163,13 @@ bool FrontSkipSame() {
     return skip;
 }
 
+// Lichii #488: these executable methods only store the value and have no dirty flag.
+// Index-buffer writes and topology_override have additional effects and must still be sent.
+bool FrontDropsSameVertexStore(u32 method) {
+    return method == MAXWELL3D_REG_INDEX(vertex_buffer.first) ||
+           method == MAXWELL3D_REG_INDEX(vertex_buffer.count);
+}
+
 } // Anonymous namespace
 
 Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSplit& split) {
@@ -1171,6 +1183,7 @@ Maxwell3D::FrontState& Maxwell3D::Front(Core::System& system, VideoCommon::GpuSp
         std::memcpy(front->shadow.data(), shadow_state.reg_array.data(), sizeof(front->shadow));
         front->control = shadow_state.shadow_ram_control;
         front->skip_same = SkipSameValueWrites() && FrontSkipSame();
+        front->skip_vertex_stores = VideoCommon::Nx2DrawExperiments::VertexStores();
         front->executing_macro = executing_macro;
         front->parameters = std::move(macro_params);
         macro_params.clear();
@@ -1213,12 +1226,18 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         fs.control_writes[fs.control_count++ % fs.control_writes.size()] = {
             argument, static_cast<u32>(fs.control), from_macro ? 2U : 1U};
     }
-    if (execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept)) {
+    const int loop_mode = execution_mask[method]
+                              ? (from_macro ? fs.macro_loop_mode : VideoCore::Nx2Debug::LoopSkipMode())
+                              : 0;
+    const bool loop_candidate =
+        execution_mask[method] && FrontSkipsLoopWrite(fs, method, value, shadow_kept, loop_mode);
+    if (loop_candidate && loop_mode == 1) {
         if (Profile::Enabled()) [[unlikely]] {
             Profile::Add(Profile::Counter::SameValueWrites, 1);
         }
         return;
     }
+    const bool verify_loop = loop_candidate && loop_mode == 2;
     using Effect = VideoCommon::GpuSplit::Effect;
     const bool track = split.ListTargetMode() != 0;
     Effect effect = fs.draw_pending ? Effect::Gpu : Effect::None;
@@ -1234,6 +1253,11 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
         }
         fs.regs[method] = value;
     } else {
+        if (loop_mode != 2 && fs.skip_vertex_stores && FrontDropsSameVertexStore(method) &&
+            fs.regs[method] == value && shadow_kept && fs.skip_same && !fs.sink_pending) {
+            Profile::Add(Profile::Counter::SameValueWrites, 1);
+            return;
+        }
         fs.regs[method] = value;
         if (track) {
             effect = VideoCommon::SplitWriteTracker::Combine(effect, FrontMethodEffect(method));
@@ -1272,14 +1296,19 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 fs.regs[MAXWELL3D_REG_INDEX(const_buffer.offset)] += sizeof(u32);
             } else if (!FrontHandledOutsideDrawManager(method)) {
                 fs.draw_pending = true;
+                if (!verify_loop) {
+                    fs.loop_draw_pending = true;
+                }
             }
             break;
         }
     }
     if (from_macro) {
-        split.MacroWrite(this, method, argument, effect);
+        split.MacroWrite(this, method, argument, effect, verify_loop);
+        fs.sink_pending = false;
     } else {
-        split.Method(this, method, argument, is_last_call, nullptr, effect);
+        split.Method(this, method, argument, is_last_call, nullptr, effect, verify_loop);
+        fs.sink_pending = !execution_mask[method];
     }
     if (cb_write) {
         split.NoteWrite(memory_manager, *cb_write, sizeof(u32));
@@ -1321,13 +1350,6 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
         }
         return;
     }
-    if (amount != 0) {
-        // The value the back acts on: in Replay mode, the shadow copy rather than the word.
-        FrontTrackInstanceLoop(fs, method,
-                               fs.control == Regs::ShadowRamControl::Replay
-                                   ? fs.shadow[method]
-                                   : base_start[amount - 1]);
-    }
     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
     const auto tracked = [&fs] {
@@ -1358,6 +1380,10 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             fs.regs[method] = last;
         }
         fs.draw_pending = true;
+        fs.loop_draw_pending = true;
+        if (amount != 0) {
+            FrontTrackInstanceLoop(fs, method, 0);
+        }
         effect = VideoCommon::SplitWriteTracker::Combine(effect, Effect::Gpu);
     } else {
         // CallMethod for each word, macro uploads among them (load_mme.instruction). A word may
@@ -1374,6 +1400,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             } else if (fs.control == Regs::ShadowRamControl::Replay) {
                 value = fs.shadow[method];
             }
+            FrontTrackInstanceLoop(fs, method, value);
             fs.regs[method] = value;
             if (!execution_mask[method]) {
                 continue;
@@ -1407,12 +1434,14 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
             default:
                 if (!FrontHandledOutsideDrawManager(method)) {
                     fs.draw_pending = true;
+                    fs.loop_draw_pending = true;
                 }
                 break;
             }
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr, effect);
+    fs.sink_pending = false;
     if (cb_write) {
         split.NoteWrite(memory_manager, *cb_write, u64{amount} * sizeof(u32));
     } else if (track && method == MAXWELL3D_REG_INDEX(report_semaphore.query) && amount != 0) {
@@ -1425,6 +1454,7 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
 
 void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
                               FrontState& fs) {
+    fs.macro_loop_mode = VideoCore::Nx2Debug::LoopSkipMode();
     const u32 method = fs.executing_macro;
     fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
@@ -1469,9 +1499,20 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
-        split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
-                    VideoCommon::GpuSplit::Effect::Gpu);
+        if (fs.macro_loop_mode == 2) {
+            split.Defer(
+                [this, system_ptr = &system, would_skip = !fs.loop_draw_pending] {
+                    FinishFrontMacro(*system_ptr, true, would_skip);
+                },
+                VideoCommon::GpuSplit::Effect::Gpu);
+        } else {
+            split.Defer([this, system_ptr = &system] { FinishFrontMacro(*system_ptr); },
+                        VideoCommon::GpuSplit::Effect::Gpu);
+        }
+        fs.sink_pending = false;
     }
+    fs.loop_draw_pending = false;
+    fs.macro_loop_mode = -1;
     if (FrontVerifyEnabled() && (++fs.calls & 4095) == 0) [[unlikely]] {
         FrontVerify(split, fs);
     }
@@ -1497,8 +1538,11 @@ void Maxwell3D::FrontTrackInstanceLoop(FrontState& fs, u32 method, u32 value) {
     }
 }
 
-bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept) {
+bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool shadow_kept, int mode) {
     FrontTrackInstanceLoop(fs, method, value);
+    if (fs.sink_pending) {
+        return false;
+    }
     switch (method) {
     case MAXWELL3D_REG_INDEX(draw.end):
     case MAXWELL3D_REG_INDEX(vertex_buffer.first):
@@ -1507,8 +1551,7 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool 
     default:
         return false;
     }
-    if (VideoCore::Nx2Debug::g_loop_skip.load(std::memory_order_relaxed) == 0 || !fs.skip_same ||
-        !shadow_kept || fs.regs[method] != value) {
+    if ((mode != 1 && mode != 2) || !fs.skip_same || !shadow_kept || fs.regs[method] != value) {
         return false;
     }
     // Instance loop methods: they flush no deferred draw, and the draw manager ignores these
@@ -1810,7 +1853,78 @@ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
     }
 }
 
-void Maxwell3D::FinishFrontMacro(Core::System& system) {
+void Maxwell3D::VerifyLoopSkip(u32 method, u32 argument) {
+    size_t index{};
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(draw.end):
+        index = 0;
+        break;
+    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+        index = 1;
+        break;
+    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+        index = 2;
+        break;
+    default:
+        UNREACHABLE_MSG("Unexpected loop-skip candidate {:#x}", method);
+        return;
+    }
+    auto& counts = loop_skip_verification.methods[index];
+    ++counts.checked;
+    counts.sink_pending += !method_sink.empty();
+    const auto control = shadow_state.shadow_ram_control;
+    const u32 value =
+        control == Regs::ShadowRamControl::Replay ? shadow_state.reg_array[method] : argument;
+    counts.value_mismatch += regs.reg_array[method] != value;
+    counts.shadow_mismatch +=
+        (control == Regs::ShadowRamControl::Track ||
+         control == Regs::ShadowRamControl::TrackWithFilter) &&
+        shadow_state.reg_array[method] != argument;
+    counts.draw_mode_mismatch +=
+        index == 0 &&
+        draw_manager.draw_state.draw_mode != DrawManager::DrawMode::Instance;
+    ReportLoopSkipVerification();
+}
+
+void Maxwell3D::VerifyLoopMacroFinish(bool would_skip) {
+    auto& counts = loop_skip_verification;
+    ++counts.macro_checked;
+    if (would_skip) {
+        ++counts.macro_would_skip;
+        counts.macro_sink_pending += !method_sink.empty();
+        counts.macro_deferred_draw += draw_manager.HasDeferredDraw();
+        // Even an empty DrawDeferred resets drawn_instances when the loop does not continue.
+        counts.macro_drawn_instances += draw_manager.draw_state.drawn_instances != 0;
+    }
+    ReportLoopSkipVerification();
+}
+
+void Maxwell3D::ReportLoopSkipVerification() {
+    auto& counts = loop_skip_verification;
+    const u64 events = ++counts.events;
+    if ((events & (events - 1)) != 0 && (events & ((u64{1} << 20) - 1)) != 0) {
+        return;
+    }
+    constexpr std::array names{"draw.end", "vertex.first", "vertex.count"};
+    std::string line;
+    for (size_t i = 0; i < names.size(); ++i) {
+        const auto& method = counts.methods[i];
+        line += fmt::format(" | {} checked={} sink_pending={} value_mismatch={} "
+                            "shadow_mismatch={} draw_mode_mismatch={}",
+                            names[i], method.checked, method.sink_pending, method.value_mismatch,
+                            method.shadow_mismatch, method.draw_mode_mismatch);
+    }
+    LOG_INFO(HW_GPU, "Loop skip verify: engine={} as={} events={}{} | macro.finish checked={} "
+                    "would_skip={} sink_pending={} deferred_draw={} drawn_instances={}",
+             fmt::ptr(this), memory_manager.GetID(), events, line, counts.macro_checked,
+             counts.macro_would_skip, counts.macro_sink_pending, counts.macro_deferred_draw,
+             counts.macro_drawn_instances);
+}
+
+void Maxwell3D::FinishFrontMacro(Core::System& system, bool verify_loop, bool would_skip) {
+    if (verify_loop) {
+        VerifyLoopMacroFinish(would_skip);
+    }
     // What ProcessMacro and CallMacroMethod do around the macro.
     ConsumeSink(system);
     draw_manager.DrawDeferred(*this);

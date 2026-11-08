@@ -82,7 +82,8 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
 inline bool g_enabled = false;
 
 inline void ReadSetting() {
-    g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+    const char* value = std::getenv("EDEN_NX2_GPU_PROFILE");
+    g_enabled = value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
 inline bool Enabled() {

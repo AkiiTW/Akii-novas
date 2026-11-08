@@ -538,6 +538,10 @@ size_t GpuSplit::Execute(const u64* entry, size_t words) {
         const u32 method = static_cast<u32>((head >> 8) & 0xffff);
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
+        if ((head & VerifyLoop) != 0) {
+            // Before ConsumeSink: consuming it is itself an effect the front must not lose.
+            static_cast<Tegra::Engines::Maxwell3D*>(engine)->VerifyLoopSkip(method, argument);
+        }
         if (engine->fast_maxwell3d) {
             // Nx2Perf: as below without the profile zones (off with fast_maxwell3d) and the
             // virtual call.

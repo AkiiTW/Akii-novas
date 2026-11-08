@@ -519,12 +519,19 @@ bool RasterizerOpenGL::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheT
 }
 
 VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64 size) {
+    std::optional<VideoCore::RasterizerDownloadArea> texture_area;
     {
         std::scoped_lock lock{texture_cache.mutex};
-        auto area = texture_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
+        texture_area = texture_cache.GetFlushArea(addr, size);
+        if (texture_area && !VideoCommon::Nx2DrawExperiments::PartialReadTraps()) {
+            return *texture_area;
         }
+    }
+    if (texture_area) {
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.ForgetReadTraps(texture_area->start_address,
+                                    texture_area->end_address - texture_area->start_address);
+        return *texture_area;
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};

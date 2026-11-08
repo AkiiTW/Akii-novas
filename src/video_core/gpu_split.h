@@ -129,13 +129,13 @@ public:
     /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
     using Effect = SplitWriteTracker::Effect;
     void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
-                const GPUVAddr* segment, Effect effect = Effect::Unknown) {
+                const GPUVAddr* segment, Effect effect = Effect::Unknown, bool verify_loop = false) {
         SelectEngine(engine);
         const size_t words = segment != nullptr ? 2 : 1;
         u64* const entry = Reserve(words);
         entry[0] = static_cast<u64>(Kind::Method) | (is_last ? IsLast : 0) |
                    (segment != nullptr ? HasSegment : 0) | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
+                   (u64{argument} << 32) | (verify_loop ? VerifyLoop : 0);
         if (segment != nullptr) {
             entry[1] = *segment;
         }
@@ -146,11 +146,11 @@ public:
                      Effect effect = Effect::Unknown);
     /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
     void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument,
-                    Effect effect = Effect::Unknown) {
+                    Effect effect = Effect::Unknown, bool verify_loop = false) {
         SelectEngine(engine);
         u64* const entry = Reserve(1);
         entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
-                   (u64{argument} << 32);
+                   (u64{argument} << 32) | (verify_loop ? VerifyLoop : 0);
         Commit(1, effect);
     }
 
@@ -351,6 +351,7 @@ private:
     static constexpr u64 IsLast = 1 << 4;
     static constexpr u64 HasSegment = 1 << 5;
     static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+    static constexpr u64 VerifyLoop = 1 << 7; ///< Method: Maxwell3D loop-skip candidate, still executed.
 
     std::unordered_map<u64, u64> async_writes; ///< Front: 16-byte slot -> ring position
     std::unordered_map<u64, u64> fence_writes; ///< Front: 16-byte slot -> ring position

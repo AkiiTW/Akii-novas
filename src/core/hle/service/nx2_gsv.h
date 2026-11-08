@@ -1755,17 +1755,21 @@ private:
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
             return value == nullptr ? -1 : value[0] == '1' ? 1 : 0;
         }();
-        // Donkey Kong Bananza's channels wait on each other every frame, so it always ran a frame
-        // ahead, where it rewrote memory the GPU thread hadn't read yet (misread commands, then
-        // a freeze or crash; rubberbanding while moving). Title 1 runs ahead without either.
+        // Donkey Kong Bananza's channels wait on each other every frame, so in the automatic mode
+        // (-1) it always ran a frame ahead, even with the GPU still behind, where it rewrote memory
+        // the GPU thread hadn't read yet (misread commands, then a freeze or crash; rubberbanding
+        // while moving; 6 of 9 runs, 6a22450d8). Mode 1 runs ahead only while the previous frame
+        // is done and waits for this one too when the GPU is behind (gpu_behind below): in the
+        // owner's runs of 2026-11-07 (bench and a 5-minute session) it neither froze nor
+        // rubberbanded, and Bananza went from ~39 to ~45 presents a second, spending most of its
+        // time at 60 instead of 30. Title 1 runs ahead without either.
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         // Ocarina waited ~12 ms a frame on its previous frame's fence here (#161).
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
         int frames_ahead = frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
-        if (frames_ahead == -1 && app_program_id == DonkeyKongBananzaProgramId) {
-            frames_ahead = 0;
-        } else if (frames_ahead == -1 && app_program_id == OcarinaOfTimeProgramId) {
+        if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
+                                   app_program_id == OcarinaOfTimeProgramId)) {
             frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();

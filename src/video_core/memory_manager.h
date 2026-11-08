@@ -199,6 +199,7 @@ private:
     /// Immutable copy of the device-contiguous runs and the kind map that readers query without
     /// a lock; each thread swaps its copy when map_serial changes.
     struct MappingSnapshot {
+        u64 serial{};
         struct Run {
             GPUVAddr begin;
             GPUVAddr end;

@@ -21,6 +21,7 @@
 #include "common/logging.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/nx2_perf.h"
+#include "video_core/nx2_draw_experiments.h"
 
 namespace VideoCommon {
 
@@ -163,7 +164,8 @@ struct WordManager {
     /// @param size            Size in bytes of the CPU range to loop over
     /// @param func            Function to call for each turned off region
     template <typename Func>
-    void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func) {
+    void ForEachModifiedRange(Type type, bool clear, VAddr query_cpu_range, s64 size, Func&& func,
+                              bool skip_empty = Nx2DrawExperiments::CleanWords()) {
         //static_assert(type != Type::Untracked);
         std::span<u64> state_words = Span(type);
         std::span<u64> untracked_words = Span(Type::Untracked);
@@ -181,6 +183,13 @@ struct WordManager {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
+            // Eglantine 172565989: an empty CPU word can still have untracked pages to arm.
+            // Otherwise no state changes, including the local clean_words summary.
+            if (skip_empty && word == 0 &&
+                (!clear || ((type != Type::CPU && type != Type::CachedCPU) ||
+                            (untracked_words[index] & mask) == 0))) {
+                return;
+            }
             if (clear) {
                 if (type == Type::CPU || type == Type::CachedCPU) {
                     CollectChangedRanges(true, index, untracked_words[index], mask, ranges);

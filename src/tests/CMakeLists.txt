@@ -8,6 +8,7 @@ add_executable(tests
     common/addon_config.cpp
     video_core/buffer_cache_ports.cpp
     video_core/virtual_range_cache.cpp
+    video_core/nx2_draw_experiments.cpp
     video_core/unswizzle_workers.cpp
     video_core/aftermath_dump.cpp
     video_core/frame_dump_schedule.cpp

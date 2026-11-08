@@ -46,6 +46,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2_download_trace.h"
+#include "video_core/nx2_draw_experiments.h"
 #include "video_core/surface.h"
 #include "video_core/texture_cache/types.h"
 
@@ -274,6 +275,13 @@ public:
     void DownloadMemory(DAddr device_addr, u64 size);
 
     std::optional<VideoCore::RasterizerDownloadArea> GetFlushArea(DAddr device_addr, u64 size);
+
+    /// A texture read can consume traps also tracked by this buffer cache.
+    void ForgetReadTraps(DAddr device_addr, u64 size) {
+        const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
+        const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        read_trapped_ranges.Subtract(begin, end - begin);
+    }
 
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
@@ -752,6 +760,12 @@ private:
     void ArmReadTraps(DAddr device_addr, u64 size) {
         const DAddr begin = Common::AlignDown(device_addr, Core::DEVICE_PAGESIZE);
         const DAddr end = Common::AlignUp(device_addr + size, Core::DEVICE_PAGESIZE);
+        if (Nx2DrawExperiments::PartialReadTraps()) {
+            read_trapped_ranges.Arm(begin, end - begin, [this](DAddr part, u64 part_size) {
+                device_memory.ArmReadTraps(part, part_size);
+            });
+            return;
+        }
         if (!read_trapped_ranges.Arm(begin, end - begin)) {
             return;
         }

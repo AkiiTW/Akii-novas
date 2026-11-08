@@ -110,6 +110,7 @@ add_library(video_core STATIC
     invalidation_accumulator.h
     memory_manager.cpp
     memory_manager.h
+    memory_layout_cache.h
     page_filter.h
     pipeline_cache_policy.h
     native_qmd.h
@@ -119,6 +120,7 @@ add_library(video_core STATIC
     nx2_debug_control.cpp
     nx2_debug_control.h
     nx2_profile.h
+    nx2_draw_experiments.h
     nx2_sync_profile.h
     nx2_perf.h
     nx2_download_trace.h

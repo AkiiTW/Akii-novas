@@ -35,10 +35,26 @@ inline std::atomic<int> g_sem_fast{EnvSwitch("EDEN_NX2_SEM_FAST")};
 /// compute and copies while no page was newly GPU-written for 2 s; =2 also checks each skipped
 /// entry on the back and logs misses (dma_pusher.cpp).
 inline std::atomic<int> g_list_fast{EnvSwitch("EDEN_NX2_LIST_FAST")};
-/// EXPERIMENT (not for nx2): EDEN_NX2_LOOP_SKIP=1, the split's front does not send the instance
-/// loop writes the back would ignore (draw.end in an instance loop, unchanged vertex and index
-/// buffer firsts and counts) (maxwell_3d.cpp).
-inline std::atomic<int> g_loop_skip{EnvSwitch("EDEN_NX2_LOOP_SKIP")};
+/// EXPERIMENT (not for nx2): EDEN_NX2_LOOP_SKIP=1 omits unchanged vertex_buffer.first/count and
+/// draw.end in an instance loop, only with no pending sink. =2 sends and verifies the candidates.
+/// -1 means not initialized yet: the frontend must apply nx2_switches.txt before reading it.
+inline std::atomic<int> g_loop_skip{-1};
+
+inline int InitializeLoopSkip(std::atomic<int>& setting, const char* value) {
+    const int requested = value != nullptr && (value[0] == '1' || value[0] == '2') && value[1] == '\0'
+                              ? value[0] - '0'
+                              : 0;
+    int expected = -1;
+    // A live override (including 0) wins even if initialization races with it.
+    return setting.compare_exchange_strong(expected, requested, std::memory_order_relaxed)
+               ? requested
+               : expected;
+}
+
+inline int LoopSkipMode() {
+    const int mode = g_loop_skip.load(std::memory_order_relaxed);
+    return mode != -1 ? mode : InitializeLoopSkip(g_loop_skip, std::getenv("EDEN_NX2_LOOP_SKIP"));
+}
 
 /// The live switch called `name`, or null.
 [[nodiscard]] inline std::atomic<int>* FindSwitch(std::string_view name) {
@@ -52,6 +68,7 @@ inline std::atomic<int> g_loop_skip{EnvSwitch("EDEN_NX2_LOOP_SKIP")};
         return &g_list_fast;
     }
     if (name == "EDEN_NX2_LOOP_SKIP") {
+        LoopSkipMode();
         return &g_loop_skip;
     }
     return nullptr;

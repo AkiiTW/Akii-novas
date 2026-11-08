@@ -27,6 +27,8 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
+#include "video_core/nx2_draw_experiments.h"
 #include "video_core/renderer_null/null_rasterizer.h"
 
 namespace VideoCommon {
@@ -89,6 +91,22 @@ struct GpuSplitTestAccess {
 namespace {
 
 using Tegra::Engines::Maxwell3D;
+
+class ScopedLoopSkip {
+public:
+    explicit ScopedLoopSkip(int mode)
+        : setting{VideoCore::Nx2Debug::FindSwitch("EDEN_NX2_LOOP_SKIP")},
+          previous{setting->exchange(mode, std::memory_order_relaxed)} {}
+    ~ScopedLoopSkip() {
+        setting->store(previous, std::memory_order_relaxed);
+    }
+    ScopedLoopSkip(const ScopedLoopSkip&) = delete;
+    ScopedLoopSkip& operator=(const ScopedLoopSkip&) = delete;
+
+private:
+    std::atomic<int>* setting;
+    int previous;
+};
 
 constexpr u32 CbSize = MAXWELL3D_REG_INDEX(const_buffer.size);
 constexpr u32 CbAddressHigh = MAXWELL3D_REG_INDEX(const_buffer.address_high);
@@ -947,6 +965,318 @@ TEST_CASE("Maxwell3D takes its macros back from the split's front once the split
     engine.CallMethod(f.system, StartAddress, 0x40, true);
     CHECK(engine.shadow_state.reg_array[state] == 0x1234);
     CHECK(engine.GetNativeMacroPositions()[0] == 0x40);
+}
+
+TEST_CASE("Split vertex store elision preserves sink and shadow effects",
+          "[video_core][dkb_draw_experiments][dkb_vertex_stores]") {
+    const ScopedLoopSkip loop_skip{0};
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Shadow = Maxwell3D::Regs::ShadowRamControl;
+    Fixture f;
+    f.system.Initialize();
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    auto& engine = f.fast;
+    constexpr u32 first = MAXWELL3D_REG_INDEX(vertex_buffer.first);
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    const bool enabled = VideoCommon::Nx2DrawExperiments::VertexStores();
+    const auto send = [&](u32 method, u32 value) {
+        engine.FrontCallMethod(f.system, split, method, value, true);
+    };
+    const auto complete = [&] { split.Drain(); };
+    const auto repeat = [&](u32 method, u32 value, bool can_skip) {
+        const u64 before = Access::End(split);
+        send(method, value);
+        REQUIRE((Access::End(split) == before) == (enabled && can_skip));
+        complete();
+    };
+    send(ShadowControl, static_cast<u32>(Shadow::Track));
+    send(first, 3);
+    send(count, 12);
+    complete();
+    repeat(first, 3, true);
+    repeat(count, 12, true);
+
+    // Even an unchanged executable must consume a preceding state write before other engines.
+    const u32 state = MAXWELL3D_REG_INDEX(global_base_instance_index);
+    send(state, 41);
+    repeat(count, 12, false);
+    REQUIRE(engine.method_sink.empty());
+    REQUIRE(engine.regs.reg_array[state] == 41);
+
+    // Method runs also consume the sink. A following unchanged vertex store can be omitted.
+    send(state, 42);
+    const std::array<u32, 1> values{12};
+    engine.FrontCallMultiMethod(f.system, split, count, values.data(), 1, 1);
+    repeat(count, 12, true);
+    REQUIRE(engine.method_sink.empty());
+    REQUIRE(engine.regs.reg_array[state] == 42);
+
+    // Equal register value, different shadow value: the Track write must reach the back.
+    send(ShadowControl, static_cast<u32>(Shadow::Passthrough));
+    send(first, 7);
+    send(ShadowControl, static_cast<u32>(Shadow::Track));
+    repeat(first, 7, false);
+    REQUIRE(engine.shadow_state.reg_array[first] == 7);
+    send(ShadowControl, static_cast<u32>(Shadow::Replay));
+    repeat(first, 99, true); // Effective value is the shadow's 7, not the supplied 99.
+    REQUIRE(engine.regs.reg_array[first] == 7);
+
+    send(ShadowControl, static_cast<u32>(Shadow::Track));
+    complete();
+    // These look like stores but carry dirty flags or deferred-draw effects.
+    for (const u32 method : {static_cast<u32>(MAXWELL3D_REG_INDEX(index_buffer.first)),
+                            static_cast<u32>(MAXWELL3D_REG_INDEX(topology_override))}) {
+        const u32 value = engine.regs.reg_array[method];
+        send(method, value); // Establish matching shadow and register values.
+        complete();
+        repeat(method, value, false);
+    }
+}
+
+TEST_CASE("Loop skip consumes a pending sink before switching engines",
+          "[video_core][loop_skip][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    constexpr u32 state = MAXWELL3D_REG_INDEX(global_base_instance_index);
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    struct Observer final : Tegra::Engines::EngineInterface {
+        Maxwell3D* source{};
+        bool sink_empty{};
+        u32 value{};
+        void CallMethod(Core::System&, u32, u32, bool) override {
+            sink_empty = source->method_sink.empty();
+            value = source->regs.global_base_instance_index;
+        }
+        void CallMultiMethod(Core::System&, u32, const u32*, u32, u32) override {}
+    };
+    for (const int mode : {1, 2}) {
+        CAPTURE(mode);
+        const ScopedLoopSkip loop_skip{mode};
+        Fixture f;
+        f.system.Initialize();
+        VideoCommon::GpuSplit split;
+        Observer observer;
+        observer.source = &f.fast;
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        const auto send = [&](u32 method, u32 value) {
+            f.fast.FrontCallMethod(f.system, split, method, value, true);
+        };
+        send(ShadowControl, static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Track));
+        send(count, 12);
+        split.Drain();
+        const u64 safe_before = Access::End(split);
+        send(count, 12);
+        REQUIRE((Access::End(split) == safe_before) == (mode == 1));
+        split.Drain();
+        send(state, 41);
+        const u64 before = Access::End(split);
+        send(count, 12);
+        REQUIRE(Access::End(split) > before);
+        split.MacroWrite(&observer, 0x10, 0);
+        split.Drain();
+        REQUIRE(observer.sink_empty);
+        REQUIRE(observer.value == 41);
+    }
+}
+
+TEST_CASE("Loop skip tracks every effective draw begin in a packet",
+          "[video_core][loop_skip][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Shadow = Maxwell3D::Regs::ShadowRamControl;
+    using DrawMode = Maxwell3D::DrawManager::DrawMode;
+    constexpr u32 subsequent = 1U << 26;
+    constexpr u32 unchanged = 2U << 26;
+    for (const int mode : {1, 2}) {
+        CAPTURE(mode);
+        const ScopedLoopSkip loop_skip{mode};
+        Fixture f;
+        f.system.Initialize();
+        VideoCommon::GpuSplit split;
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        const auto send = [&](u32 method, u32 value) {
+            f.fast.FrontCallMethod(f.system, split, method, value, true);
+        };
+        send(ShadowControl, static_cast<u32>(Shadow::Track));
+        send(DrawBegin, 0);
+        send(DrawEnd, 0);
+        send(DrawBegin, subsequent);
+        const u64 instance_before = Access::End(split);
+        send(DrawEnd, 0);
+        REQUIRE((Access::End(split) == instance_before) == (mode == 1));
+        const std::array<u32, 2> values{0, unchanged};
+        f.fast.FrontCallMultiMethod(f.system, split, DrawBegin, values.data(), 2, 2);
+        split.Drain();
+        REQUIRE(f.fast.draw_manager.draw_state.draw_mode == DrawMode::General);
+        const auto check_end = [&] {
+            const u64 before = Access::End(split);
+            send(DrawEnd, 0);
+            REQUIRE(Access::End(split) > before);
+            split.Drain();
+        };
+        check_end();
+
+        // Replay must use Unchanged from shadow RAM, not Subsequent from the packet.
+        send(ShadowControl, static_cast<u32>(Shadow::Replay));
+        const std::array<u32, 2> replay_values{subsequent, subsequent};
+        f.fast.FrontCallMultiMethod(f.system, split, DrawBegin, replay_values.data(), 2, 2);
+        check_end();
+        REQUIRE(f.fast.draw_manager.draw_state.draw_mode == DrawMode::General);
+
+        send(ShadowControl, static_cast<u32>(Shadow::Track));
+        send(DrawBegin, subsequent);
+        const std::array<u32, 1> indices{0};
+        f.fast.FrontCallMultiMethod(f.system, split, MAXWELL3D_REG_INDEX(draw_inline_index),
+                                   indices.data(), 1, 1);
+        check_end();
+        if (mode == 2) {
+            const auto& counts = f.fast.GetLoopSkipVerification().methods[0];
+            REQUIRE(counts.checked == 1);
+            REQUIRE(counts.sink_pending == 0);
+            REQUIRE(counts.value_mismatch == 0);
+            REQUIRE(counts.shadow_mismatch == 0);
+            REQUIRE(counts.draw_mode_mismatch == 0);
+        }
+    }
+}
+
+TEST_CASE("Loop skip verifier detects back effects without suppressing writes",
+          "[video_core][loop_skip][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    using Effect = VideoCommon::GpuSplit::Effect;
+    using Shadow = Maxwell3D::Regs::ShadowRamControl;
+    constexpr u32 count = MAXWELL3D_REG_INDEX(vertex_buffer.count);
+    constexpr u32 state = MAXWELL3D_REG_INDEX(global_base_instance_index);
+    const ScopedLoopSkip loop_skip{2};
+    for (const bool fast : {false, true}) {
+        CAPTURE(fast);
+        Fixture f;
+        f.system.Initialize();
+        auto& engine = fast ? f.fast : f.slow;
+        VideoCommon::GpuSplit split;
+        Access::Start(split, f.system);
+        SCOPE_EXIT { split.Stop(); };
+        split.MacroWrite(&engine, ShadowControl, static_cast<u32>(Shadow::Track));
+        split.Method(&engine, state, 42, true, nullptr);
+        // Deliberately mark unsafe candidates: the checker must run before ConsumeSink.
+        split.Method(&engine, count, 0, true, nullptr, Effect::None, true);
+        split.MacroWrite(&engine, count, 7, Effect::None, true);
+        split.Method(&engine, DrawEnd, 0, true, nullptr, Effect::None, true);
+        split.MacroWrite(&engine, ShadowControl, static_cast<u32>(Shadow::Replay));
+        split.MacroWrite(&engine, count, 99, Effect::None, true);
+        split.Drain();
+        const auto& counts = engine.GetLoopSkipVerification();
+        REQUIRE(counts.methods[2].checked == 3);
+        REQUIRE(counts.methods[2].sink_pending == 1);
+        REQUIRE(counts.methods[2].value_mismatch == 1);
+        REQUIRE(counts.methods[2].shadow_mismatch == 1);
+        REQUIRE(counts.methods[0].checked == 1);
+        REQUIRE(counts.methods[0].draw_mode_mismatch == 1);
+        REQUIRE(engine.method_sink.empty());
+        REQUIRE(engine.regs.reg_array[state] == 42);
+        REQUIRE(engine.regs.reg_array[count] == 7);
+        REQUIRE(engine.shadow_state.reg_array[count] == 7);
+
+        split.Defer([&engine, state] {
+            engine.method_sink.emplace_back(state, 43);
+            auto& draw = engine.draw_manager.draw_state;
+            draw.draw_mode = Maxwell3D::DrawManager::DrawMode::Instance;
+            draw.instance_count = 1;
+            draw.drawn_instances = 3;
+            engine.VerifyLoopMacroFinish(true);
+        });
+        split.Drain();
+        REQUIRE(counts.macro_checked == 1);
+        REQUIRE(counts.macro_would_skip == 1);
+        REQUIRE(counts.macro_sink_pending == 1);
+        REQUIRE(counts.macro_deferred_draw == 1);
+        REQUIRE(counts.macro_drawn_instances == 1);
+    }
+}
+
+TEST_CASE("Loop skip verifies macro finish and preserves DrawDeferred resets",
+          "[video_core][loop_skip][gpu_split_dependencies]") {
+    using Access = VideoCommon::GpuSplitTestAccess;
+    const ScopedLoopSkip loop_skip{2};
+    Fixture f;
+    f.system.Initialize();
+    auto& engine = f.fast;
+    auto& macro = engine.GetNativeMacroEngine();
+    macro.native_turing = true;
+    macro.ClearCode(0);
+    // Two TU104 instructions: emit vertex_buffer.count=12, then an empty end delay slot.
+    for (const bool emit : {true, false}) {
+        std::array<u32, 3> bits{};
+        const auto field = [&](u32 offset, u32 size, u32 value) {
+            for (u32 bit = 0; bit < size; ++bit) {
+                bits[(offset + bit) / 32] |= ((value >> bit) & 1U) << ((offset + bit) % 32);
+            }
+        };
+        for (const u32 offset : {15U, 20U, 25U, 51U, 56U, 61U}) {
+            field(offset, 5, 24); // ADD zero + zero, discard both ALU results.
+        }
+        if (emit) {
+            field(0, 1, 1);
+            field(30, 16, MAXWELL3D_REG_INDEX(vertex_buffer.count));
+            field(66, 16, 12);
+            field(82, 3, 5); // Method from immediate 0.
+            field(85, 4, 6); // Value from immediate 1.
+        }
+        for (const u32 word : {bits[2], bits[1], bits[0]}) {
+            macro.AddCode(0, word);
+        }
+    }
+    engine.GetNativeMacroPositions()[0] = 0;
+    VideoCommon::GpuSplit split;
+    Access::Start(split, f.system);
+    SCOPE_EXIT { split.Stop(); };
+    engine.FrontCallMethod(f.system, split, ShadowControl,
+                           static_cast<u32>(Maxwell3D::Regs::ShadowRamControl::Track), true);
+    const auto call = [&] {
+        engine.FrontCallMethod(f.system, split, 0xe00, 0, true);
+        split.Drain();
+        REQUIRE_FALSE(macro.native_execution_failed);
+    };
+    call();
+    REQUIRE(engine.regs.vertex_buffer.count == 12);
+    call();
+    const auto& counts = engine.GetLoopSkipVerification();
+    REQUIRE(counts.methods[2].checked == 1);
+    REQUIRE(counts.methods[2].sink_pending == 0);
+    REQUIRE(counts.methods[2].value_mismatch == 0);
+    REQUIRE(counts.methods[2].shadow_mismatch == 0);
+    REQUIRE(counts.macro_checked == 2);
+    REQUIRE(counts.macro_would_skip == 1);
+    REQUIRE(counts.macro_deferred_draw == 0);
+    REQUIRE(counts.macro_drawn_instances == 0);
+    split.Defer([&engine] { engine.draw_manager.draw_state.drawn_instances = 3; });
+    call();
+    REQUIRE(counts.macro_would_skip == 2);
+    REQUIRE(counts.macro_drawn_instances == 1);
+    REQUIRE(engine.draw_manager.draw_state.drawn_instances == 0);
+}
+
+TEST_CASE("Loop skip initializes lazily and preserves live overrides including zero",
+          "[video_core][loop_skip]") {
+    using VideoCore::Nx2Debug::InitializeLoopSkip;
+    for (const auto& [text, expected] : std::array<std::pair<const char*, int>, 7>{{
+             {nullptr, 0}, {"", 0}, {"0", 0}, {"1", 1}, {"2", 2}, {"3", 0}, {"20", 0}}}) {
+        CAPTURE(text, expected);
+        std::atomic<int> setting{-1};
+        REQUIRE(InitializeLoopSkip(setting, text) == expected);
+        REQUIRE(setting.load() == expected);
+        REQUIRE(InitializeLoopSkip(setting, "1") == expected);
+    }
+    const ScopedLoopSkip loop_skip{2};
+    auto* setting = VideoCore::Nx2Debug::FindSwitch("EDEN_NX2_LOOP_SKIP");
+    REQUIRE(VideoCore::Nx2Debug::LoopSkipMode() == 2);
+    setting->store(0);
+    REQUIRE(InitializeLoopSkip(*setting, "2") == 0);
+    REQUIRE(VideoCore::Nx2Debug::LoopSkipMode() == 0);
+    setting->store(1);
+    REQUIRE(VideoCore::Nx2Debug::LoopSkipMode() == 1);
 }
 
 TEST_CASE("Maxwell3D keeps state written after the split stops over the front's shadow RAM",

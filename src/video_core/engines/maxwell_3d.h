@@ -3276,7 +3276,34 @@ public:
 
     void ProcessInlineIndexMultiData(u32 method, const u32* start_base, u32 amount);
 
+    struct LoopSkipCounters {
+        u64 checked{};
+        u64 sink_pending{};
+        u64 value_mismatch{};
+        u64 shadow_mismatch{};
+        u64 draw_mode_mismatch{};
+    };
+    struct LoopSkipVerification {
+        // draw.end, vertex_buffer.first, vertex_buffer.count, in that order.
+        std::array<LoopSkipCounters, 3> methods{};
+        u64 events{};
+        u64 macro_checked{};
+        u64 macro_would_skip{};
+        u64 macro_sink_pending{};
+        u64 macro_deferred_draw{};
+        u64 macro_drawn_instances{};
+    };
+    /// Back thread only. Mode 2 checks candidates without suppressing their original execution.
+    void VerifyLoopSkip(u32 method, u32 argument);
+    void VerifyLoopMacroFinish(bool would_skip);
+    /// Read on the back, or after the caller has drained it.
+    const LoopSkipVerification& GetLoopSkipVerification() const {
+        return loop_skip_verification;
+    }
+
 private:
+    LoopSkipVerification loop_skip_verification;
+    void ReportLoopSkipVerification();
     void InitializeRegisterDefaults();
 
     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
@@ -3402,7 +3429,7 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
-    bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
+    bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept, int mode);
     void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
                               const u32* words, u32 count);
     /// FrontDmaRead without draining the back, when the words can be known: false otherwise.
@@ -3411,7 +3438,7 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 macro, u32 method,
                       u32 count);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
-    void FinishFrontMacro(Core::System& system);
+    void FinishFrontMacro(Core::System& system, bool verify_loop = false, bool would_skip = false);
     std::unique_ptr<FrontState> front;
     bool front_macros{};
     // EDEN_NX2_SPLIT_VERIFY: the last SET_SHADOW_RAM_CONTROL writes each side saw (argument,
